@@ -1,17 +1,24 @@
 import random
 import string
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from db import supabase
 from settlement import compute_settlements
 from recommendations import generate_booking_recommendations
-from fastapi import FastAPI, HTTPException, UploadFile, File
 from ocr_service import parse_receipt_image
 
-app = FastAPI(title="WanderSplit API", version="1.0.0")
+# Explicitly bind Swagger docs routes
+app = FastAPI(
+    title="WanderSplit API",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json"
+)
 
+# CORS configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,6 +26,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Root route for uptime & health verification
+@app.get("/")
+def root():
+    return {
+        "status": "online",
+        "service": "WanderSplit Backend",
+        "docs": "/docs"
+    }
 
 # 1. TRIP ONBOARDING
 class CreateTripRequest(BaseModel):
@@ -160,7 +176,9 @@ def get_trip_settlement(trip_id: str):
             "splits": splits
         })
 
-    return compute_settlements(members, expenses_with_splits, refunds_with_splits) # 4. REFUNDS & CANCELLATION LEDGER
+    return compute_settlements(members, expenses_with_splits, refunds_with_splits)
+
+# 4. REFUNDS & CANCELLATION LEDGER
 class RefundBeneficiary(BaseModel):
     member_id: str
     credited_amount: float
@@ -180,7 +198,6 @@ def record_refund(payload: RecordRefundRequest):
     if not payload.beneficiaries:
         raise HTTPException(status_code=400, detail="At least one beneficiary required.")
 
-    # Validate that split amounts equal the total refund received
     total_distributed = sum([b.credited_amount for b in payload.beneficiaries])
     if round(total_distributed, 2) != round(payload.total_refund_amount, 2):
         raise HTTPException(
@@ -188,7 +205,6 @@ def record_refund(payload: RecordRefundRequest):
             detail=f"Beneficiary distribution sum ({total_distributed}) does not match total refund ({payload.total_refund_amount})."
         )
 
-    # 1. Insert header transaction
     refund_res = supabase.table("refund_transactions").insert({
         "trip_id": payload.trip_id,
         "original_item_id": payload.original_item_id,
@@ -202,7 +218,6 @@ def record_refund(payload: RecordRefundRequest):
 
     refund_id = refund_res.data[0]["id"]
 
-    # 2. Insert individual splits
     refund_splits = [
         {
             "refund_id": refund_id,
@@ -219,24 +234,20 @@ def record_refund(payload: RecordRefundRequest):
         "refund_id": refund_id,
         "message": f"Successfully credited refund of ₹{payload.total_refund_amount}"
     }
+
 # 5. AI BOOKING RECOMMENDATIONS
 @app.get("/api/trips/{trip_id}/recommendations")
 def get_trip_recommendations(trip_id: str):
-    # 1. Fetch trip metadata
     trip_res = supabase.table("trips").select("destination, budget").eq("id", trip_id).execute()
     if not trip_res.data:
         raise HTTPException(status_code=404, detail="Trip not found.")
     trip = trip_res.data[0]
     
-    # 2. Count members
     members = supabase.table("trip_members").select("id").eq("trip_id", trip_id).execute().data or []
-    
-    # 3. Sum current expenses and gather booked categories
     items = supabase.table("itinerary_items").select("total_cost, category").eq("trip_id", trip_id).execute().data or []
     total_spent = sum([float(item.get("total_cost", 0)) for item in items])
     categories = list(set([item.get("category") for item in items if item.get("category")]))
     
-    # 4. Generate AI recommendations
     return generate_booking_recommendations(
         destination=trip.get("destination", "India"),
         total_budget=float(trip.get("budget", 0)),
@@ -244,6 +255,7 @@ def get_trip_recommendations(trip_id: str):
         member_count=max(len(members), 1),
         booked_categories=categories
     )
+
 # 6. OCR RECEIPT & TICKET SCANNER
 @app.post("/api/expenses/scan")
 async def scan_expense_receipt(file: UploadFile = File(...)):
